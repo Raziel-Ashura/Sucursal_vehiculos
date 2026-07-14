@@ -3,6 +3,7 @@ pipeline {
 
     tools {
         maven 'M3'
+        jdk 'JDK21'
     }
 
     environment {
@@ -10,10 +11,11 @@ pipeline {
         CONTAINER_NAME = 'contenedor_sucursal'
         APP_PORT = '9090'
         CONTAINER_PORT = '8080'
-        APP_CONTEXT_PATH = 'vehiculosBuild'
+        APP_CONTEXT = 'vehiculosBuild'
     }
 
     stages {
+
         stage('Checkout Source Code') {
             steps {
                 checkout scmGit(
@@ -29,15 +31,9 @@ pipeline {
         stage('Validate RDS MySQL Credentials') {
             steps {
                 withCredentials([
-                    string(
-                        credentialsId: 'dev-rds-mysql-sucursal-jdbc-url',
-                        variable: 'SPRING_DATASOURCE_URL'
-                    ),
-                    usernamePassword(
-                        credentialsId: 'dev-rds-mysql-sucursal-credentials',
-                        usernameVariable: 'SPRING_DATASOURCE_USERNAME',
-                        passwordVariable: 'SPRING_DATASOURCE_PASSWORD'
-                    )
+                    string(credentialsId: 'DB_URL', variable: 'SPRING_DATASOURCE_URL'),
+                    string(credentialsId: 'DB_USER', variable: 'SPRING_DATASOURCE_USERNAME'),
+                    string(credentialsId: 'DB_PASS', variable: 'SPRING_DATASOURCE_PASSWORD')
                 ]) {
                     sh '''
                         set +x
@@ -45,17 +41,14 @@ pipeline {
                         echo "Validando credenciales y conexión a Amazon RDS MySQL..."
 
                         if ! command -v mysql >/dev/null 2>&1; then
-                          echo "ERROR: El cliente mysql no está instalado en el servidor Jenkins."
-                          echo "Instale mysql-client o mariadb-client antes de ejecutar el pipeline."
-                          exit 1
+                            echo "ERROR: El cliente mysql no está instalado."
+                            exit 1
                         fi
 
                         case "$SPRING_DATASOURCE_URL" in
-                          jdbc:mysql://*)
-                            echo "Formato JDBC MySQL detectado correctamente."
-                            ;;
+                          jdbc:mysql://*) ;;
                           *)
-                            echo "ERROR: SPRING_DATASOURCE_URL no tiene formato jdbc:mysql://"
+                            echo "ERROR: URL JDBC inválida."
                             exit 1
                             ;;
                         esac
@@ -69,37 +62,21 @@ pipeline {
                         MYSQL_HOST="${MYSQL_HOST_PORT%%:*}"
 
                         if echo "$MYSQL_HOST_PORT" | grep -q ':'; then
-                          MYSQL_PORT="${MYSQL_HOST_PORT##*:}"
+                            MYSQL_PORT="${MYSQL_HOST_PORT##*:}"
                         else
-                          MYSQL_PORT="3306"
+                            MYSQL_PORT="3306"
                         fi
-
-                        if [ -z "$MYSQL_HOST" ]; then
-                          echo "ERROR: No se pudo obtener el host de RDS desde SPRING_DATASOURCE_URL."
-                          exit 1
-                        fi
-
-                        if [ -z "$MYSQL_DATABASE" ] || [ "$MYSQL_DATABASE" = "$MYSQL_HOST_PORT" ]; then
-                          echo "ERROR: No se pudo obtener el nombre de la base de datos desde SPRING_DATASOURCE_URL."
-                          exit 1
-                        fi
-
-                        echo "Host RDS detectado: $MYSQL_HOST"
-                        echo "Puerto RDS detectado: $MYSQL_PORT"
-                        echo "Base de datos detectada: $MYSQL_DATABASE"
-
-                        echo "Probando autenticación contra Amazon RDS MySQL..."
 
                         MYSQL_PWD="$SPRING_DATASOURCE_PASSWORD" mysql \
-                          --protocol=TCP \
-                          --connect-timeout=10 \
-                          -h "$MYSQL_HOST" \
-                          -P "$MYSQL_PORT" \
-                          -u "$SPRING_DATASOURCE_USERNAME" \
-                          "$MYSQL_DATABASE" \
-                          -e "SELECT 'Conexion RDS MySQL OK' AS resultado, DATABASE() AS base_datos;"
+                            --protocol=TCP \
+                            --connect-timeout=10 \
+                            -h "$MYSQL_HOST" \
+                            -P "$MYSQL_PORT" \
+                            -u "$SPRING_DATASOURCE_USERNAME" \
+                            "$MYSQL_DATABASE" \
+                            -e "SELECT 'Conexion OK';"
 
-                        echo "Validación correcta: Jenkins puede conectarse a RDS MySQL con las credenciales configuradas."
+                        echo "Conexión RDS validada correctamente."
                     '''
                 }
             }
@@ -108,10 +85,10 @@ pipeline {
         stage('Build WAR Artifact') {
             steps {
                 sh '''
-                    echo "Compilando aplicación y generando archivo WAR..."
+                    echo "Compilando aplicación..."
                     mvn clean package -DskipTests
 
-                    echo "Validando artefacto generado..."
+                    echo "WAR generado:"
                     ls -lh target/*.war
                 '''
             }
@@ -120,7 +97,7 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    echo "Construyendo imagen Docker de la aplicación..."
+                    echo "Construyendo imagen Docker..."
                     docker build -t "$IMAGE_NAME" .
                 '''
             }
@@ -129,34 +106,26 @@ pipeline {
         stage('Deploy Application Container') {
             steps {
                 withCredentials([
-                    string(
-                        credentialsId: 'dev-rds-mysql-sucursal-jdbc-url',
-                        variable: 'SPRING_DATASOURCE_URL'
-                    ),
-                    usernamePassword(
-                        credentialsId: 'dev-rds-mysql-sucursal-credentials',
-                        usernameVariable: 'SPRING_DATASOURCE_USERNAME',
-                        passwordVariable: 'SPRING_DATASOURCE_PASSWORD'
-                    )
+                    string(credentialsId: 'DB_URL', variable: 'ENV_DB_URL'),
+                    string(credentialsId: 'DB_USER', variable: 'ENV_DB_USER'),
+                    string(credentialsId: 'DB_PASS', variable: 'ENV_DB_PASS')
                 ]) {
                     sh '''
                         set +x
 
-                        echo "Deteniendo contenedor anterior si existe..."
+                        echo "Deteniendo contenedor anterior..."
                         docker stop "$CONTAINER_NAME" || true
                         docker rm "$CONTAINER_NAME" || true
 
-                        echo "Levantando contenedor con variables de conexión hacia Amazon RDS MySQL..."
+                        echo "Iniciando contenedor..."
 
                         docker run -d \
                           -p "$APP_PORT:$CONTAINER_PORT" \
                           --name "$CONTAINER_NAME" \
-                          -e SPRING_DATASOURCE_URL="$SPRING_DATASOURCE_URL" \
-                          -e SPRING_DATASOURCE_USERNAME="$SPRING_DATASOURCE_USERNAME" \
-                          -e SPRING_DATASOURCE_PASSWORD="$SPRING_DATASOURCE_PASSWORD" \
+                          -e DB_URL="$ENV_DB_URL" \
+                          -e DB_USER="$ENV_DB_USER" \
+                          -e DB_PASS="$ENV_DB_PASS" \
                           "$IMAGE_NAME"
-
-                        echo "Contenedor desplegado correctamente."
                     '''
                 }
             }
@@ -165,14 +134,16 @@ pipeline {
         stage('Inspect Container Logs') {
             steps {
                 sh '''
-                    echo "Esperando inicio de Tomcat/Spring Boot..."
-                    sleep 25
+                    echo "Esperando inicio de Tomcat..."
+                    sleep 30
 
-                    echo "Estado del contenedor:"
+                    echo ""
+                    echo "Contenedor:"
                     docker ps --filter "name=$CONTAINER_NAME"
 
-                    echo "Últimos logs del contenedor:"
-                    docker logs --tail=80 "$CONTAINER_NAME"
+                    echo ""
+                    echo "Últimos logs:"
+                    docker logs --tail=100 "$CONTAINER_NAME"
                 '''
             }
         }
@@ -180,8 +151,15 @@ pipeline {
         stage('Verify Application Availability') {
             steps {
                 sh '''
-                    echo "Validando endpoint raíz de la aplicación..."
-                    curl -f -s "http://localhost:$APP_PORT/$APP_CONTEXT_PATH/" || exit 1
+                    echo "Esperando 10 segundos adicionales..."
+                    sleep 10
+
+                    echo "===== Verificando OpenAPI ====="
+                    curl -i "http://localhost:$APP_PORT/$APP_CONTEXT/v3/api-docs"
+
+                    echo ""
+                    echo "===== Verificando endpoint /vehiculos ====="
+                    curl -i "http://localhost:$APP_PORT/$APP_CONTEXT/vehiculos"
                 '''
             }
         }
@@ -189,15 +167,20 @@ pipeline {
         stage('Run API Smoke Tests') {
             steps {
                 sh '''
-                    echo "Validando OpenAPI / Swagger..."
-                    curl -f -s "http://localhost:$APP_PORT/$APP_CONTEXT_PATH/api-docs" || exit 1
+                    STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+                        "http://localhost:$APP_PORT/$APP_CONTEXT/vehiculos")
 
-                    echo "Validando endpoint GET /vehiculos..."
-                    curl -f -s "http://localhost:$APP_PORT/$APP_CONTEXT_PATH/vehiculos" || exit 1
+                    echo "HTTP Status: $STATUS"
 
-                    echo "Validaciones funcionales finalizadas correctamente."
+                    if [ "$STATUS" != "200" ]; then
+                        echo "La API respondió con un código diferente de 200."
+                        exit 1
+                    fi
+
+                    echo "Smoke tests OK."
                 '''
             }
         }
     }
 }
+
